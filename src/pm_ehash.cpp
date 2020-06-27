@@ -1,12 +1,43 @@
 #include"pm_ehash.h"
 
+#define  BIT_NUM  8
+#defien  BUCKET_NUM    256
+
 /**
  * @description: construct a new instance of PmEHash in a default directory
  * @param NULL
  * @return: new instance of PmEHash
  */
 PmEHash::PmEHash() {
+	this->metadata = NULL;
+	std::vector<char> v;
+	if (FILE *fp = fopen("metadata", "r"))
+	{
+		char buf[1024];
+		while (size_t len = fread(buf, 1, sizeof(buf), fp))
+			v.insert(v.end(), buf, buf + len);
+		fclose(fp);
+	}
+	if(v){
+		catalog.buckets_pm_address = new pm_address[metadata->catalog_size];
+		for(int i = 0; i < metadata->catalog_size; i++){
+			catalog.buckets_pm_address[i].fileId = 1;
+			catalog.buckets_pm_address[i].offset = 0;
+		}
+		write(&catalog);
+	}
 
+	else{
+		strcpy(v,&this->catalog);
+		if(strcpy(v,'1') == 1){
+			catalog.buckets_pm_address = new pm_address[metadata->catalog_size];
+			for(int i = 0; i < metadata->catalog_size; i++){
+				catalog.buckets_pm_address[i].fileId = 1;
+				catalog.buckets_pm_address[i].offset = 0;
+			}
+			write(&catalog);
+		}
+	}
 }
 /**
  * @description: persist and munmap all data in NVM
@@ -14,7 +45,12 @@ PmEHash::PmEHash() {
  * @return: NULL
  */
 PmEHash::~PmEHash() {
-
+    size_t map_len;
+    int is_pmem;
+    data_page* tdata = pmem_map_file("file",sizeof(data_page),PMEN_FILE_CREATE,0777,&map_len, &is_pmem);
+    tdata->record = this->record;
+    pmem_persist(tdata,map_len);
+    pmen_unmap(tdata,map_len);
 }
 
 /**
@@ -23,7 +59,16 @@ PmEHash::~PmEHash() {
  * @return: 0 = insert successfully, -1 = fail to insert(target data with same key exist)
  */
 int PmEHash::insert(kv new_kv_pair) {
-    return 1;
+    uint64_t temp;
+    if (search(new_kv_pair.key, temp) == 0)
+        return -1;
+
+    pm_bucket* bucket = get_Free_Bucket(new_kv_pair.key);
+
+    kv* freePlace = get_Free_Kv_Place(bucket);
+    *freePlace = new_kv_pair;
+    persist(freePlace, sizeof(freePlace));
+    return 0;
 }
 
 /**
@@ -32,7 +77,23 @@ int PmEHash::insert(kv new_kv_pair) {
  * @return: 0 = removing successfully, -1 = fail to remove(target data doesn't exist)
  */
 int PmEHash::remove(uint64_t key) {
-    return 1;
+    uint64_t hash_key = hashFunc(key);
+    uint64_t mask = (1 << metadata->global_depth) - 1;
+    uint64_t page_id= hash_key & mask;
+
+    pm_bucket* bucket = bucketTable[page_id];
+    for (int i = 0; i < BUCKET_NUM / BIT_NUM; ++i) {
+        uint8_t bit_map = bucket->bitmap[i];
+        for (int j = 0; j < BIT_NUM; ++j) {
+            if (((bit_map >> (BIT_NUM -1 - j)) & 1) == 1 && bucket->slot[i * BIT_NUM + j].key == key) {
+                bucket->bitmap[i] &= ~(1 << (BIT_NUM - 1 - j)); 
+                persist(&bucket->bitmap[i], sizeof(bucket->bitmap[i]));
+                mergeBucket(page_id);
+                return 0; 
+            }
+        }
+    }
+    return -1;
 }
 /**
  * @description: 更新现存的键值对的值
@@ -40,7 +101,18 @@ int PmEHash::remove(uint64_t key) {
  * @return: 0 = update successfully, -1 = fail to update(target data doesn't exist)
  */
 int PmEHash::update(kv kv_pair) {
-    return 1;
+    pm_bucket* bucket = key_2_bucket(kv_pair.key);
+    for (int i = 0; i < BUCKET_NUM / BIT_NUM; ++i) {
+        uint8_t bitmap = bucket->bitmap[i];
+        for (int j = 0; j < BIT_NUM; ++j) {
+            if (((bitmap >> (BIT_NUM -1 - j)) & 1) == 1 && bucket->slot[i * BIT_NUM+j].key == kv_pair.key) {
+                bucket->slot[i*8+j].value = kv_pair.value;
+                persist(&bucket->slot[i*8+j], sizeof(bucket->slot[i*8+j]));
+                return 0; 
+            }
+        }
+    }
+    return -1;
 }
 /**
  * @description: 查找目标键值对数据，将返回值放在参数里的引用类型进行返回
@@ -49,7 +121,23 @@ int PmEHash::update(kv kv_pair) {
  * @return: 0 = search successfully, -1 = fail to search(target data doesn't exist) 
  */
 int PmEHash::search(uint64_t key, uint64_t& return_val) {
-    return 1;
+    uint64_t hash_key = hashFunc(key);
+    uint64_t mask = (1 << metadata->global_depth) - 1;
+    uint64_t page_id = hash_key & mask;
+    pm_bucket* bucket = bucketTable[page_id];
+    for (int i = 0; i < BUCKET_NUM / BIT_NUM; ++i) {
+        uint8_t bitmap = bucket->bitmap[i];
+        for (int j = 0; j < BIT_NUM; ++j) {
+            if (((bitmap >> (BIT_NUM - 1 - j)) & 1) == 1 ) {
+                if (bucket->slot[i * BIT_NUM + j].key == key) {
+                    return_val = bucket->slot[i * BIT_NUM + j].value;
+                    return 0;
+                }
+
+            }
+        }
+    }
+    return -1;
 }
 
 /**
@@ -67,7 +155,23 @@ uint64_t PmEHash::hashFunc(uint64_t key) {
  * @return: 空闲桶的虚拟地址
  */
 pm_bucket* PmEHash::getFreeBucket(uint64_t key) {
+    uint64_t hash_key = hashFunc(key);
+    uint64_t mask = (1 << metadata->global_depth) - 1;
+    uint64_t page_id = hash_key & mask;
 
+    pm_bucket* bucket = bucketTable[page_id]; 
+    for (int i = 0; i < BUCKET_NUM / BIT_NUM; ++i) {
+        uint8_t bitmap = bucket->bitmap[i];
+        for (int j = 0; j < BIT_NUM; ++j) {
+            if (((bitmap >> (BIT_NUM - 1 - j)) & 1) == 0) {//找到桶中的第一个空位
+                return bucket;
+            }
+        }
+    }
+   /*进行桶分裂*/
+    splitBucket(page_id);
+    /*递归调用*/
+    return get_Free_Bucket(key);
 }
 
 /**
@@ -76,7 +180,17 @@ pm_bucket* PmEHash::getFreeBucket(uint64_t key) {
  * @return: 空闲键值对位置的虚拟地址
  */
 kv* PmEHash::getFreeKvSlot(pm_bucket* bucket) {
-
+ for (int i = 0; i < BUCKET_NUM / BIT_NUM; ++i) {
+        uint8_t bitmap = bucket->bitmap[i];
+        for (int j = 0; j < BIT_NUM; ++j) {
+            if (((bitmap >> (BIT_NUM - 1 - j)) & 1) == 0) {
+                bucket->bitmap[i] |= (1 << (BIT_NUM - 1 - j)); //标记为被占用
+                persist(&bucket->bitmap[i], sizeof(bucket->bitmap[i]));
+                return &bucket->slot[i * BIT_NUM+j];
+            }
+        }
+    }
+    return NULL;
 }
 
 /**
@@ -84,8 +198,52 @@ kv* PmEHash::getFreeKvSlot(pm_bucket* bucket) {
  * @param uint64_t: 目标桶在目录中的序号
  * @return: NULL
  */
-void PmEHash::splitBucket(uint64_t bucket_id) {
 
+void PmEHash::splitBucket(uint64_t bucket_id) {
+    bucket_id = minTrueBucket(bucket_id);
+
+    pm_bucket* bucket = bucketTable[bucket_id];
+    bucket->local_depth += 1;
+    persist(&bucket->local_depth, sizeof(bucket->local_depth));
+    depth_count[bucket->local_depth] += 2;
+    depth_count[bucket->local_depth - 1] -= 1;
+    pm_bucket* new_bucket = NULL;
+    if (free_list.empty()) {
+        allocNewPage();
+        if (free_list.empty()) {
+            cout << "page allocate wrong\n";
+        }
+
+    }
+
+    new_bucket = free_list.front();
+    free_list.pop();
+    pm_address address = vAddr2pmAddr[new_bucket];
+    int bucket_index = (address.offset - DATA_PAGE_SLOT_NUM) / sizeof(pm_bucket);
+    page_pointers[address.fileId]->used[bucket_index] = true;
+    if (bucket->local_depth > metadata->global_depth) {
+        extendPageID();
+    }
+    new_bucket->local_depth = bucket->local_depth;
+    uint64_t add = (1 << (bucket->local_depth - 1));
+    uint64_t cur_id = bucket_id + add;
+    bucketTable[cur_id] = new_bucket;
+
+    SetPageIdToSameBucket(cur_id, add, bucket, new_bucket);
+    int k = 0; 
+    for (int i = 0; i < BUCKET_NUM; ++i) {
+        uint64_t key = bucket->slot[i].key;
+        key = hashFunc(key);
+        if ((key >> (bucket->local_depth - 1)) & 1) { 
+            new_bucket->slot[k] = bucket->slot[i];
+            new_bucket->bitmap[k/BIT_NUM] |= (1 << (BIT_NUM - 1 - (k % BIT_NUM))); 
+            bucket->bitmap[i/8] &= ~(1 << (BIT_NUM - 1 - (i % BIT_NUM)));  
+            k++;
+        }
+    }
+    persist(bucket, sizeof(pm_bucket));
+    persist(new_bucket, sizeof(pm_bucket));
+    persist(&page_pointers[address.fileId]->used, sizeof(page_pointers[address.fileId]->used));
 }
 
 /**
